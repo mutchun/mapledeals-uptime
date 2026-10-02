@@ -11,3 +11,5 @@ External uptime probe for https://mapledeals.app (MD-775 launch ops watch, secti
 The canonical copy is mirrored in the private app repo at `scripts/uptime-probe/uptime.yml`. Runbook: `docs/ops/LAUNCH_OPS_RUNBOOK.md` in that repo (`#uptime-down`, `#probe-failure`).
 
 GitHub cron is best effort and can run late; treat this as a fallback pager next to the droplet's own probes (ops_monitor.sh) and a hosted keyword monitor.
+
+Schedule: every 5 min (minutes 2,7,...,57). If the Actions tab shows no `schedule` runs, push any commit to main to re-register it.
