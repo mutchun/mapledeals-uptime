@@ -1,0 +1,624 @@
+# mirror of mutchun/mapledeals-uptime .github/workflows/uptime.yml - the probe repo copy is live; edit there, then re-mirror
+# MD-775 Launch ops watch
+#
+# MD-775 - external uptime probe for mapledeals.app (launch ops watch, section B).
+#
+# What: a GitHub-hosted runner (outside the droplet, so it sees what a visitor
+# sees: DNS, TLS, Apache, Next, the API and MySQL) GETs
+#   https://mapledeals.app/                           -> 200 + our Next markup + deal cards
+#   https://mapledeals.app/api/app-config             -> 200 + success envelope + platform block
+#   https://mapledeals.app/api/dealList?page=1&limit=1 -> 200 + success envelope + one deal row
+# and pages the droplet ops Telegram channel on the 2nd consecutive failed
+# check, re-pages on every 12th consecutive failure and sends one RECOVERED
+# line when a check passes after an alert. The dealList check is the one that
+# sees MySQL: app-config falls back to defaults (still 200) when the DB is
+# down, and the home page is ISR (stale HTML with cards survives an API/DB
+# outage). DealList returns 400 on a DB error and errors are never cached
+# (its guest cache is 45 s).
+#
+# Hosting: this file runs in the PUBLIC repo mutchun/mapledeals-uptime, where
+# standard runners are free. Never put it in a private repo's
+# .github/workflows: each run bills at least 1 min, so */5 is about 8,640
+# min/month (*/10 about 4,320, */15 about 2,880 - each over the Free 2,000 /
+# Pro 3,000 included minutes before counting existing CI; running out blocks
+# every workflow, deploy and required checks included), and every scheduled
+# run attaches to the default branch HEAD SHA (deploy watchers that match on
+# headSha would see it). The mapledeals-platform copy is a mirror at
+# scripts/uptime-probe/uptime.yml, not a workflow. The file is repo-agnostic
+# (no checkout, no repo paths; it reads github.repository and its own file
+# name); only RUNBOOK_HINT points at mapledeals-platform on purpose.
+#
+# State without a cache or a repo write: the run's own conclusion IS the probe
+# result. The probe / history / alert steps never fail the run
+# (continue-on-error); the last step fails it only when the probe failed,
+# after any Telegram send. Each run reads this workflow's previous completed
+# runs from the Actions API, newest check first (ordered by run_started_at,
+# which resets on a re-run), and counts the consecutive-failure streak. Only
+# 'success' and 'failure' count; cancelled / skipped / timed_out runs are
+# ignored. Where a page or RECOVERED depends on it, a failed run counts only if
+# its "Record the probe result as the run conclusion" step failed (a run that
+# failed for GitHub-side reasons is ignored). Do not add steps that can fail
+# for non-probe reasons, and keep that step name in sync with RECORD_STEP_NAME.
+#
+# Caveats:
+# - GitHub cron is best effort with NO upper bound on lateness. In
+#   mutchun/mapledeals-platform the daily nightly-tests schedule (0 9 * * *)
+#   started 3.5-8 h late on every run from 2026-09-12 to 2026-10-01, and
+#   under load GitHub drops scheduled fires instead of queueing them. So this
+#   probe is a fallback external check, not a guaranteed 5-min pager. The
+#   primary external pager should be a hosted keyword monitor (UptimeRobot /
+#   Better Stack free tier with their Telegram integration - an Alex action),
+#   or an external cron that POSTs
+#   repos/mutchun/mapledeals-uptime/actions/workflows/uptime.yml/dispatches
+#   every 5 min (fine-grained PAT with actions:write on the probe repo only;
+#   dispatch runs share the same streak). The minutes avoid :00 (GitHub's
+#   busiest moment). Each job summary prints the gap since the previous run;
+#   measure the real cadence from the runs API after the first day.
+# - Schedules only fire from the default branch (inert until merged there).
+# - GitHub disables a public repo's schedules after 60 days without repository
+#   activity. The "Keep the schedule enabled" step calls the workflow enable
+#   API once a week (Monday, the 04 UTC hour; best effort). Backstop: the
+#   runbook's state check (gh api .../workflows/uptime.yml --jq .state).
+# - A failed run also triggers GitHub's own failed-workflow notification
+#   (email / web) to the workflow owner: a free second channel, but noisy.
+# - Requests carry User-Agent "MapleDeals-uptime-probe/1.0" (3 per run). The
+#   droplet traffic counters do not filter it (about 9 requests and up to 3
+#   runner IPs per 15 min); filter on that UA prefix if it ever matters.
+# - Prefer "Run workflow" (a fresh dispatch) over re-running an old run. A
+#   re-run is counted as a check at its own start time and replaces that
+#   run's earlier result.
+#
+# Secrets (Settings > Secrets and variables > Actions): TG_OPS_BOT_TOKEN and
+# TG_OPS_CHAT_ID, the same pair as the droplet ops alerts. Missing secrets
+# only print a warning; the probe and the run state still work.
+#
+# Alert test (dispatch needs the file on the default branch):
+# Actions > Uptime Probe > Run workflow with home_marker set to a string that
+# is not on the page (e.g. md775-no-such-marker), twice back to back right
+# after a scheduled run finishes (a scheduled success in between resets the
+# streak). The 2nd run sends UPTIME DOWN; the next normal run sends UPTIME
+# RECOVERED.
+
+name: Uptime Probe
+
+on:
+  schedule:
+    # Every 5 min, offset from :00.
+    - cron: '2,7,12,17,22,27,32,37,42,47,52,57 * * * *'
+  workflow_dispatch:
+    inputs:
+      home_marker:
+        description: 'Home page marker override (empty = built-in markers). A wrong value forces a failed check, for the alert test.'
+        required: false
+        default: ''
+        type: string
+      config_marker:
+        description: '/api/app-config marker override (empty = built-in markers).'
+        required: false
+        default: ''
+        type: string
+
+concurrency:
+  # One probe at a time, so each run sees the previous run's conclusion.
+  # Queue, never cancel a running probe (a newer pending run replaces an older
+  # pending one; cancelled runs are ignored by the streak).
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: uptime-probe
+    runs-on: ubuntu-latest
+    # Worst case (every probe, API call and Telegram attempt hitting its
+    # timeout) is about 165 s; the budgets below keep it under this.
+    timeout-minutes: 3
+    permissions:
+      actions: write # read this workflow's previous runs (the streak state) + the weekly enable keepalive
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      SITE_LABEL: mapledeals.app
+      HOME_URL: https://mapledeals.app/
+      CONFIG_URL: https://mapledeals.app/api/app-config
+      DEALS_URL: https://mapledeals.app/api/dealList?page=1&limit=1
+      PROBE_UA: MapleDeals-uptime-probe/1.0
+      CURL_MAX_TIME_S: '15'
+      SLOW_MS: '5000'
+      DOWN_AFTER_FAILS: '2'
+      REALERT_EVERY_FAILS: '12'
+      HISTORY_PAGE_SIZE: '30'
+      HISTORY_MAX_PAGES: '10'
+      HISTORY_BUDGET_S: '45'
+      API_TIMEOUT_S: '10'
+      API_ATTEMPTS: '3'
+      LAG_ATTEMPTS: '4'
+      HISTORY_RETRY_SLEEP_S: '5'
+      VERIFY_MAX_RUNS: '4'
+      TG_MAX_TIME_S: '10'
+      TG_ATTEMPTS: '3'
+      TG_RETRY_SLEEP_S: '3'
+      TG_RETRY_MAX_WAIT_S: '6'
+      KEEPALIVE_UTC_HOUR: '04'
+      RECORD_STEP_NAME: Record the probe result as the run conclusion
+      RUNBOOK_HINT: 'first action: ssh root@138.197.148.169 /opt/mapledeals/scripts/launch_status.sh (runbook: https://github.com/mutchun/mapledeals-platform/blob/main/docs/ops/LAUNCH_OPS_RUNBOOK.md#probe-failure)'
+    steps:
+      - name: Probe endpoints
+        continue-on-error: true
+        env:
+          HOME_MARKER_OVERRIDE: ${{ inputs.home_marker }}
+          CONFIG_MARKER_OVERRIDE: ${{ inputs.config_marker }}
+        run: |
+          # Never fails on its own: results go to files the later steps read,
+          # and only the last step turns a failed probe into a red run.
+          set -uo pipefail
+          set +e
+          work="$RUNNER_TEMP/uptime"
+          mkdir -p "$work"
+          date -u +%s > "$work/start_epoch"
+          : > "$work/results.tsv"
+          rm -f "$work/probe_ok" "$work/notes"
+
+          # Printable ASCII only, one line (Telegram text + summary cells).
+          ascii() { tr '\n\t' '  ' | LC_ALL=C tr -cd '\40-\176' | sed 's/ *$//'; }
+
+          # probe <name> <url> <marker>... -> one TSV row:
+          # name, url, http code, latency ms, ok (1/0), reason, cache header
+          probe() {
+            local name="$1" url="$2"
+            shift 2
+            local body="$work/$name.body" hdr="$work/$name.hdr" err="$work/$name.err"
+            local out rc code secs ms reason="" cache marker ok
+            out=$(curl -sS --max-time "$CURL_MAX_TIME_S" -A "$PROBE_UA" \
+              -o "$body" -D "$hdr" -w '%{http_code} %{time_total}' "$url" 2>"$err")
+            rc=$?
+            code="${out%% *}"
+            secs="${out##* }"
+            [ -n "$code" ] || code=000
+            ms=$(awk -v s="${secs:-0}" 'BEGIN { printf "%d", s * 1000 }')
+            if [ "$rc" -ne 0 ]; then
+              reason="curl exit $rc ($(sed -E 's/^curl: \([0-9]+\) //' "$err" | head -n 1 | ascii | cut -c1-160))"
+            elif [ "$code" != 200 ]; then
+              reason="unexpected status"
+            else
+              for marker in "$@"; do
+                if ! grep -qF -- "$marker" "$body"; then
+                  reason="marker missing: $(printf '%s' "$marker" | ascii | cut -c1-120)"
+                  break
+                fi
+              done
+            fi
+            cache=$(grep -iE '^(x-md-cache|x-nextjs-cache):' "$hdr" 2>/dev/null | tail -n 1 | ascii)
+            ok=1
+            [ -z "$reason" ] || ok=0
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$url" "$code" "$ms" "$ok" \
+              "${reason:--}" "${cache:--}" >> "$work/results.tsv"
+            echo "$name: code=$code ms=$ms ok=$ok reason=${reason:-none} cache=${cache:-none} url=$url"
+            [ "$ok" = 1 ]
+          }
+
+          if [ -n "${HOME_MARKER_OVERRIDE:-}" ]; then
+            home_markers=("$HOME_MARKER_OVERRIDE")
+          else
+            # Our Next app rendered (lib/seo.ts SITE_NAME) AND the server-side
+            # feed fetch worked (DealCard testid prefix; no cards when it failed).
+            home_markers=('og:site_name" content="Maple Deals"' 'data-testid="dealCard_')
+          fi
+          if [ -n "${CONFIG_MARKER_OVERRIDE:-}" ]; then
+            config_markers=("$CONFIG_MARKER_OVERRIDE")
+          else
+            # Response envelope + the platform block (key order is fixed by
+            # Helper/platformConfig.js PLATFORM_SETTING_DEFS).
+            config_markers=('"success":true' '"platform":{' '"maintenance_mode":')
+          fi
+          # Envelope + at least one live deal row (body.Deals.data[0].id): a DB
+          # error is a 400 here, an empty catalog misses the row marker.
+          deals_markers=('"success":true' '"data":[{"id":')
+
+          probe_ok=1
+          probe home "$HOME_URL" "${home_markers[@]}" || probe_ok=0
+          probe config "$CONFIG_URL" "${config_markers[@]}" || probe_ok=0
+          probe deals "$DEALS_URL" "${deals_markers[@]}" || probe_ok=0
+          echo "$probe_ok" > "$work/probe_ok"
+
+          # Informational only, never a failed check: the maintenance flag is
+          # on (the overlay renders over a normal page, so markers still match).
+          if grep -qF '"maintenance_mode":true' "$work/config.body" 2>/dev/null; then
+            echo "maintenance_mode=true" > "$work/notes"
+            echo "::notice title=Uptime probe::maintenance_mode is ON (settings category platform)"
+          fi
+          exit 0
+
+      - name: Read previous probe results
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Writes history.env:
+          #   PREV_STREAK   consecutive failed runs right before this check
+          #   GENUINE_PREV  the same minus GitHub-side failures (resolved only
+          #                 when a page / RECOVERED depends on it)
+          #   INFRA_SKIPPED failed runs found to be GitHub-side failures
+          #   GAP_S         seconds since the previous run started (-1 unknown)
+          #   HISTORY_STATE exact (counted back to a success or the first run)
+          #                 | saturated (no success within the lookback, or
+          #                 older pages unreadable) | lagged (run #N-1 never
+          #                 showed up, the streak may be one short) | unknown
+          #                 (the run list could not be read)
+          set -uo pipefail
+          set +e
+          work="$RUNNER_TEMP/uptime"
+          mkdir -p "$work"
+          # Own file name from GITHUB_WORKFLOW_REF
+          # (owner/repo/.github/workflows/<file>@<ref>): rename / repo-move safe.
+          wf_ref="${GITHUB_WORKFLOW_REF%%@*}"
+          wf_file="${wf_ref##*/}"
+          [ -n "$wf_file" ] || wf_file=uptime.yml
+          runs_path="repos/${GITHUB_REPOSITORY}/actions/workflows/${wf_file}/runs?status=completed&per_page=${HISTORY_PAGE_SIZE}"
+
+          # api_get <path> <out>: GET with retries (transient 5xx, timeouts)
+          # inside the step budget. stdin is closed so gh never eats a loop's input.
+          api_get() {
+            local path="$1" out="$2" try=1
+            while :; do
+              if timeout "$API_TIMEOUT_S" gh api "$path" < /dev/null > "$out" 2> "$work/gh.err" \
+                && jq -e 'type == "object"' "$out" > /dev/null 2>&1; then
+                return 0
+              fi
+              if [ "$try" -ge "$API_ATTEMPTS" ] || [ "$SECONDS" -ge "$HISTORY_BUDGET_S" ]; then
+                return 1
+              fi
+              try=$((try + 1))
+              sleep "$HISTORY_RETRY_SLEEP_S"
+            done
+          }
+
+          : > "$work/runs.jsonl"
+          : > "$work/history.tsv"
+          state=saturated
+          lagged=0
+          page=1
+          # The concurrency group means every lower-numbered run of this
+          # workflow has finished (or was cancelled) before this one starts, so
+          # run #N-1 itself must be listed. The list can trail a just-finished
+          # run by a few seconds, so page 1 is re-read until that exact run
+          # number shows up (not the max: a newer cancelled run must not pass).
+          want_prev=$(( ${GITHUB_RUN_NUMBER:-1} - 1 ))
+          while [ "$page" -le "$HISTORY_MAX_PAGES" ]; do
+            if [ "$page" -eq 1 ]; then
+              tries=1
+              while :; do
+                if ! api_get "${runs_path}&page=1" "$work/runs.json"; then
+                  state=unknown
+                  echo "::warning title=Uptime probe::run history unreadable: $(head -n 1 "$work/gh.err" | cut -c1-200)"
+                  break 2
+                fi
+                [ "$want_prev" -ge 1 ] || break
+                if jq -e --argjson cur "$GITHUB_RUN_ID" --argjson want "$want_prev" \
+                  'any(.workflow_runs[]; .id != $cur and .run_number == $want)' "$work/runs.json" > /dev/null 2>&1; then
+                  break
+                fi
+                if [ "$tries" -ge "$LAG_ATTEMPTS" ] || [ "$SECONDS" -ge "$HISTORY_BUDGET_S" ]; then
+                  lagged=1
+                  echo "::warning title=Uptime probe::run #${want_prev} is still not listed; history treated as lagged"
+                  break
+                fi
+                tries=$((tries + 1))
+                sleep "$HISTORY_RETRY_SLEEP_S"
+              done
+            elif [ "$SECONDS" -ge "$HISTORY_BUDGET_S" ] || ! api_get "${runs_path}&page=${page}" "$work/runs.json"; then
+              echo "::warning title=Uptime probe::older run history unreadable (page ${page}); streak treated as saturated"
+              state=saturated
+              break
+            fi
+            n=$(jq '.workflow_runs | length' "$work/runs.json" 2>/dev/null)
+            if ! [[ "$n" =~ ^[0-9]+$ ]]; then
+              if [ "$page" -eq 1 ]; then state=unknown; else state=saturated; fi
+              echo "::warning title=Uptime probe::run history response not understood (page ${page})"
+              break
+            fi
+            # The current run is excluded (it is not completed yet anyway).
+            jq -c --argjson cur "$GITHUB_RUN_ID" \
+              '.workflow_runs[] | select(.id != $cur) | {id, c: (.conclusion // "none"), t: (.run_started_at // .created_at // "")}' \
+              "$work/runs.json" >> "$work/runs.jsonl"
+            # Newest check first across every page read so far.
+            jq -rs 'unique_by(.id) | sort_by(.t) | reverse | .[] | "\(.id)\t\(.c)\t\(.t)"' \
+              "$work/runs.jsonl" > "$work/history.tsv"
+            if awk -F'\t' '$2 == "success" { f = 1 } END { exit !f }' "$work/history.tsv"; then
+              state=exact
+              break
+            fi
+            if [ "$n" -lt "$HISTORY_PAGE_SIZE" ]; then
+              state=exact # reached the oldest run
+              break
+            fi
+            page=$((page + 1))
+          done
+          [ "$lagged" = 1 ] && [ "$state" = exact ] && state=lagged
+
+          prev=0
+          : > "$work/lead_ids"
+          if [ "$state" != unknown ]; then
+            # Leading failures up to the first success; anything that is not
+            # success / failure is skipped without breaking the streak.
+            prev=$(awk -F'\t' -v ids="$work/lead_ids" \
+              '$2 == "success" { exit } $2 == "failure" { n++; print $1 > ids } END { print n + 0 }' \
+              "$work/history.tsv")
+          fi
+
+          gap=-1
+          start=$(cat "$work/start_epoch" 2>/dev/null)
+          last_t=$(head -n 1 "$work/history.tsv" | cut -f3)
+          if [[ "$start" =~ ^[0-9]+$ ]] && [ -n "$last_t" ]; then
+            last=$(date -u -d "$last_t" +%s 2>/dev/null) && gap=$((start - last))
+          fi
+
+          # GitHub-side failures (lost runner, setup error: the run failed but
+          # its probe never recorded a failure) must not page or "recover".
+          # Checked only when a decision depends on it: 1 jobs call per failed
+          # run, newest first, until DOWN_AFTER_FAILS real failures are found.
+          probe_ok=$(cat "$work/probe_ok" 2>/dev/null)
+          [ "$probe_ok" = 1 ] || probe_ok=0
+          genuine=$prev
+          infra=0
+          need=0
+          min_fail=$((DOWN_AFTER_FAILS - 1))
+          [ "$min_fail" -ge 1 ] || min_fail=1
+          if [ "$probe_ok" = 1 ] && [ "$prev" -ge "$DOWN_AFTER_FAILS" ] && { [ "$state" = exact ] || [ "$state" = lagged ]; }; then
+            need=1
+          elif [ "$probe_ok" = 0 ] && [ "$prev" -ge "$min_fail" ] && [ "$state" = exact ]; then
+            need=1
+          fi
+          if [ "$need" = 1 ]; then
+            g=0
+            checked=0
+            unverified=0
+            while read -r id; do
+              [ -n "$id" ] || continue
+              if [ "$g" -ge "$DOWN_AFTER_FAILS" ] || [ "$checked" -ge "$VERIFY_MAX_RUNS" ] || [ "$SECONDS" -ge "$HISTORY_BUDGET_S" ]; then
+                unverified=$((unverified + 1))
+                continue
+              fi
+              checked=$((checked + 1))
+              # An unreadable jobs list counts the run as a real failure (err
+              # toward paging).
+              if api_get "repos/${GITHUB_REPOSITORY}/actions/runs/${id}/jobs?filter=latest&per_page=10" "$work/jobs.json" \
+                && ! jq -e --arg s "$RECORD_STEP_NAME" \
+                  'any(.jobs[]?.steps[]?; .name == $s and .conclusion == "failure")' "$work/jobs.json" > /dev/null 2>&1; then
+                infra=$((infra + 1))
+                echo "run id ${id}: failed without a failed probe result (GitHub-side failure); not counted"
+              else
+                g=$((g + 1))
+              fi
+            done < "$work/lead_ids"
+            genuine=$((g + unverified))
+          fi
+
+          printf 'PREV_STREAK=%s\nGENUINE_PREV=%s\nINFRA_SKIPPED=%s\nGAP_S=%s\nHISTORY_STATE=%s\n' \
+            "$prev" "$genuine" "$infra" "$gap" "$state" > "$work/history.env"
+          echo "previous consecutive failures=$prev genuine=$genuine infra_skipped=$infra gap_s=$gap history=$state pages_read=$page workflow=$wf_file elapsed=${SECONDS}s"
+          exit 0
+
+      - name: Alert on state change
+        continue-on-error: true
+        env:
+          TG_OPS_BOT_TOKEN: ${{ secrets.TG_OPS_BOT_TOKEN }}
+          TG_OPS_CHAT_ID: ${{ secrets.TG_OPS_CHAT_ID }}
+        run: |
+          set -uo pipefail
+          set +e
+          work="$RUNNER_TEMP/uptime"
+          mkdir -p "$work"
+          touch "$work/results.tsv"
+          probe_ok=$(cat "$work/probe_ok" 2>/dev/null)
+          [ "$probe_ok" = 1 ] || probe_ok=0
+          PREV_STREAK=0
+          GENUINE_PREV=0
+          INFRA_SKIPPED=0
+          GAP_S=-1
+          HISTORY_STATE=unknown
+          [ -f "$work/history.env" ] && . "$work/history.env"
+          if ! [[ "$PREV_STREAK" =~ ^[0-9]+$ && "$GENUINE_PREV" =~ ^[0-9]+$ && "$INFRA_SKIPPED" =~ ^[0-9]+$ ]]; then
+            PREV_STREAK=0; GENUINE_PREV=0; INFRA_SKIPPED=0; HISTORY_STATE=unknown
+          fi
+          case "$HISTORY_STATE" in exact|saturated|lagged|unknown) ;; *) HISTORY_STATE=unknown ;; esac
+          [[ "$GAP_S" =~ ^-?[0-9]+$ ]] || GAP_S=-1
+
+          action=none
+          cur_streak=0
+          shown=0
+          if [ "$probe_ok" = 1 ]; then
+            case "$HISTORY_STATE" in
+              exact|lagged)
+                if [ "$GENUINE_PREV" -ge "$DOWN_AFTER_FAILS" ]; then action=recovered; fi
+                shown=$((PREV_STREAK - INFRA_SKIPPED))
+                ;;
+              saturated)
+                if [ "$PREV_STREAK" -ge "$DOWN_AFTER_FAILS" ]; then action=recovered; fi
+                shown=$PREV_STREAK
+                ;;
+            esac
+          else
+            cur_streak=$((PREV_STREAK + 1))
+            case "$HISTORY_STATE" in
+              exact)
+                if [ $((GENUINE_PREV + 1)) -eq "$DOWN_AFTER_FAILS" ]; then
+                  action=down
+                  shown=$DOWN_AFTER_FAILS
+                elif [ "$REALERT_EVERY_FAILS" -gt 0 ] && [ "$cur_streak" -gt "$DOWN_AFTER_FAILS" ] \
+                  && [ $((cur_streak % REALERT_EVERY_FAILS)) -eq 0 ]; then
+                  action=down
+                  shown=$cur_streak
+                fi
+                ;;
+              lagged|unknown)
+                # History unreadable or one run short: page on every failed
+                # check rather than risk staying silent.
+                action=down
+                ;;
+              *)
+                # saturated: failing for longer than the lookback, already
+                # paged every REALERT_EVERY_FAILS checks up to here.
+                ;;
+            esac
+          fi
+
+          fails=$(awk -F'\t' '$5 == 0 { printf "%s%s %s %s", sep, $2, $3, $6; sep = "; " }' "$work/results.tsv")
+          [ -n "$fails" ] || fails="probe step recorded no result"
+          note=""
+          [ -s "$work/notes" ] && note=" [$(head -n 1 "$work/notes")]"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          more=""
+          [ "$HISTORY_STATE" = saturated ] && more="+"
+
+          # Which layer, from the pattern of failed checks.
+          okof() { awk -F'\t' -v n="$1" '$1 == n { v = $5 } END { print (v == "" ? "x" : v) }' "$work/results.tsv"; }
+          h=$(okof home)
+          c=$(okof config)
+          d=$(okof deals)
+          if [ "$h$c$d" = 000 ]; then
+            layer="droplet, network, DNS, TLS or Apache (every check failed)"
+          elif [ "$c$d" = 00 ]; then
+            layer="the API process (Mapledeals :5000) or the Apache /api proxy"
+          elif [ "$d" = 0 ]; then
+            layer="MySQL or the dealList query (app-config answers from defaults without the DB)"
+          elif [ "$c" = 0 ]; then
+            layer="the app-config handler or its marker"
+          elif [ "$h" = 0 ]; then
+            layer="MapleWeb (Next :3001) or a home page marker change"
+          else
+            layer="unknown (no failed check recorded)"
+          fi
+
+          text=""
+          case "$action" in
+            down)
+              case "$HISTORY_STATE" in
+                unknown) checks="run history unavailable, paging every failed check" ;;
+                lagged) checks="run history lagging, paging every failed check" ;;
+                *) checks="${shown} consecutive checks" ;;
+              esac
+              text="UPTIME DOWN ${SITE_LABEL} - ${fails}${note} (${checks}, GitHub runner) - likely: ${layer} - ${RUNBOOK_HINT}"
+              ;;
+            recovered)
+              text="UPTIME RECOVERED ${SITE_LABEL} after ${shown}${more} failed checks"
+              [ "$HISTORY_STATE" = lagged ] && text="${text} (run history lagging; may repeat)"
+              ;;
+          esac
+
+          # send_tg: up to TG_ATTEMPTS tries; retries only what can heal (no
+          # response, 429 after retry_after capped at TG_RETRY_MAX_WAIT_S, 5xx).
+          # Success = HTTP 200 plus a message_id.
+          send_tg() {
+            local attempt=1 resp rc http tg_body msgid desc wait ra
+            while :; do
+              resp=$(curl -sS --max-time "$TG_MAX_TIME_S" -w '\n%{http_code}' -X POST \
+                "https://api.telegram.org/bot${TG_OPS_BOT_TOKEN}/sendMessage" \
+                --data-urlencode "chat_id=${TG_OPS_CHAT_ID}" \
+                --data-urlencode "text=${text}" \
+                --data-urlencode "disable_web_page_preview=true" 2> "$work/tg.err")
+              rc=$?
+              http="${resp##*$'\n'}"
+              tg_body="${resp%$'\n'*}"
+              msgid=$(printf '%s' "$tg_body" | jq -r 'if .ok == true then .result.message_id else empty end' 2>/dev/null)
+              if [ "$http" = 200 ] && [ -n "$msgid" ]; then
+                tg_result="delivered message_id=${msgid} attempt=${attempt}"
+                echo "[telegram] delivered message_id=${msgid} attempt=${attempt}"
+                return 0
+              fi
+              desc=$(printf '%s' "$tg_body" | jq -r '.description // empty' 2>/dev/null | cut -c1-200)
+              tg_result="FAILED http=${http:-none} attempt=${attempt}/${TG_ATTEMPTS} ${desc:-$(head -n 1 "$work/tg.err" | cut -c1-200)}"
+              echo "::warning title=Uptime probe::Telegram send failed: ${tg_result}"
+              case "$http" in
+                ''|000|429|5??) ;;
+                *) [ "$rc" -ne 0 ] || return 1 ;;
+              esac
+              [ "$attempt" -lt "$TG_ATTEMPTS" ] || return 1
+              wait=$TG_RETRY_SLEEP_S
+              if [ "$http" = 429 ]; then
+                ra=$(printf '%s' "$tg_body" | jq -r '.parameters.retry_after // empty' 2>/dev/null)
+                if [[ "$ra" =~ ^[0-9]+$ ]]; then
+                  wait=$ra
+                  [ "$wait" -le "$TG_RETRY_MAX_WAIT_S" ] || wait=$TG_RETRY_MAX_WAIT_S
+                fi
+              fi
+              sleep "$wait"
+              attempt=$((attempt + 1))
+            done
+          }
+
+          tg_result="not needed"
+          if [ -n "$text" ]; then
+            text=$(printf '%s\nrun: %s' "$text" "$run_url" | LC_ALL=C tr -cd '\12\40-\176')
+            echo "Alert text:"
+            printf '%s\n' "$text"
+            if [ -z "${TG_OPS_BOT_TOKEN:-}" ] || [ -z "${TG_OPS_CHAT_ID:-}" ]; then
+              tg_result="NOT sent (TG_OPS_BOT_TOKEN / TG_OPS_CHAT_ID secrets missing)"
+              echo "::warning title=Uptime probe::Telegram secrets are not set - ${action} alert NOT sent"
+            else
+              send_tg
+            fi
+          fi
+
+          {
+            echo "## Uptime probe - ${SITE_LABEL}"
+            echo
+            echo "| Check | URL | HTTP | Latency (ms) | Result | Cache |"
+            echo "|---|---|---|---|---|---|"
+            while IFS=$'\t' read -r name url code ms ok reason cache; do
+              if [ "$ok" = 1 ]; then res="OK"; else res="FAIL: ${reason//|//}"; fi
+              if [[ "$ms" =~ ^[0-9]+$ ]] && [ "$ms" -ge "$SLOW_MS" ]; then res="$res (slow)"; fi
+              echo "| $name | $url | $code | $ms | $res | ${cache//|//} |"
+            done < "$work/results.tsv"
+            echo
+            if [ "$probe_ok" = 1 ]; then echo "- Probe: UP"; else echo "- Probe: DOWN"; fi
+            echo "- Previous consecutive failures: ${PREV_STREAK}${more} (history: ${HISTORY_STATE}; GitHub-side failures ignored: ${INFRA_SKIPPED}); current streak: ${cur_streak}"
+            if [ "$GAP_S" -ge 0 ]; then
+              echo "- Gap since the previous run started: $((GAP_S / 60))m $((GAP_S % 60))s (cron asks for 5m)"
+            fi
+            if [ "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ] 2>/dev/null; then
+              echo "- Re-run (attempt ${GITHUB_RUN_ATTEMPT}): counted as a fresh check at its own start time"
+            fi
+            echo "- Alert: ${action} (${tg_result})"
+            [ -n "$note" ] && echo "- Note:${note}"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          exit 0
+
+      - name: Keep the schedule enabled
+        if: github.event_name == 'schedule'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # GitHub disables a public repo's schedules after 60 days without
+          # repository activity; re-enabling through the API once a week
+          # (Monday, KEEPALIVE_UTC_HOUR) keeps it alive. Best effort, never
+          # fails the run.
+          set -uo pipefail
+          if [ "$(date -u +%u%H)" != "1${KEEPALIVE_UTC_HOUR}" ]; then
+            echo "Not the weekly keepalive hour."
+            exit 0
+          fi
+          wf_ref="${GITHUB_WORKFLOW_REF%%@*}"
+          wf_file="${wf_ref##*/}"
+          [ -n "$wf_file" ] || wf_file=uptime.yml
+          if timeout 10 gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf_file}/enable" \
+            < /dev/null > /dev/null 2> "$RUNNER_TEMP/keepalive.err"; then
+            echo "Workflow enable call OK (60-day inactivity keepalive)."
+          else
+            echo "::warning title=Uptime probe::keepalive enable call failed: $(head -n 1 "$RUNNER_TEMP/keepalive.err" | cut -c1-200)"
+          fi
+          exit 0
+
+      # Keep this name in sync with RECORD_STEP_NAME (the history step reads it
+      # back through the jobs API to tell a failed probe from a GitHub failure).
+      - name: Record the probe result as the run conclusion
+        run: |
+          set -euo pipefail
+          if [ "$(cat "$RUNNER_TEMP/uptime/probe_ok" 2>/dev/null || true)" = 1 ]; then
+            echo "Probe OK."
+          else
+            echo "Probe FAILED. Failing the run on purpose: the run conclusion is the state the next probe reads."
+            exit 1
+          fi
