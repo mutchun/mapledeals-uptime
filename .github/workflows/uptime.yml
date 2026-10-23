@@ -214,7 +214,11 @@ jobs:
           fi
           # Envelope + at least one live deal row (body.Deals.data[0].id): a DB
           # error is a 400 here, an empty catalog misses the row marker.
-          deals_markers=('"success":true' '"data":[{"id":')
+          # Order-independent (MD-775, 2026-10-23): the F7 public-payload
+          # allowlist (10-15) changed the deal key order, so "id" is no longer
+          # the row's first key and the old single marker '"data":[{"id":'
+          # failed every run while the API was healthy.
+          deals_markers=('"success":true' '"data":[{' '"id":')
 
           probe_ok=1
           probe home "$HOME_URL" "${home_markers[@]}" || probe_ok=0
